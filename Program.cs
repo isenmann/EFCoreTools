@@ -1,12 +1,12 @@
-using CommandLine;
 using System;
 using System.IO;
 using System.Linq;
 using System.Text;
+using CommandLine;
 
-namespace Bokio.MigrationSquasher
+namespace EFCoreTools
 {
-    class Program
+    public class Program
     {
         public class Options
         {
@@ -17,12 +17,13 @@ namespace Bokio.MigrationSquasher
             public string NewName { get; set; }
         }
 
-        const string MigrationNamePlaceholder = "$$MIGRATIONNAME$$";
-        const string MigrationNameWithTimeStampPlaceholder = "$$MIGRATIONNAMEWITHTIMESTAMP$$";
-        const string MigrationUpContentPlaceholder = "$$UP_CONTENT$$";
+        private const string MigrationNamePlaceholder = "$$MIGRATIONNAME$$";
+        private const string MigrationNameWithTimeStampPlaceholder = "$$MIGRATIONNAMEWITHTIMESTAMP$$";
+        private const string MigrationUpContentPlaceholder = "$$UP_CONTENT$$";
+        private const string MigrationDownContentPlaceholder = "$$DOWN_CONTENT$$";
         private const string MigrationTimeStampFormat = "yyyyMMddHHmmss";
 
-        static void Main(string[] args)
+        public static void Main(string[] args)
         {
             Console.WriteLine($"args:" + string.Join("\n", args));
             Parser.Default.ParseArguments<Options>(args)
@@ -39,7 +40,7 @@ namespace Bokio.MigrationSquasher
                 var targetFileName = Path.GetFileName(options.Target);
                 var targetMigrationName = targetFileName.Replace(".cs", "");
                 var newFileName = options.NewName + ".cs";
-                var dir = Path.GetDirectoryName(options.Target);
+                var dir = Path.GetDirectoryName(targetFileName);
 
                 if(targetFileName.Substring(0, 14) != newFileName.Substring(0, 14))
                 {
@@ -51,7 +52,7 @@ namespace Bokio.MigrationSquasher
                 var oneSecEarlier = timestamp.AddSeconds(-1);
                 var prepMigrationName = options.NewName.Replace(newTimeStamp, oneSecEarlier.ToString(MigrationTimeStampFormat)) + "_prep";
 
-                var migrationTemplate = File.ReadAllText("migrationtemplate.cs.template");
+                var migrationTemplate = File.ReadAllText("../migrationtemplate.cs.template");
 
                 var targetSnapshotTemplate = File.ReadAllText(Path.Combine(dir, targetMigrationName + ".Designer.cs"));
                 
@@ -64,6 +65,11 @@ namespace Bokio.MigrationSquasher
 
                 // Write new migration file
 
+                if (string.IsNullOrWhiteSpace(dir))
+                {
+                    dir = "./";
+                }
+
                 var migrationNames = Directory.GetFiles(dir)
                     .Where(f => !f.EndsWith(".Designer.cs", StringComparison.InvariantCultureIgnoreCase))
                     .ToList();
@@ -72,9 +78,12 @@ namespace Bokio.MigrationSquasher
                 .OrderBy(f => Path.GetFileName(f))
                 .ToList(); // String comparison should be fine because it's using an ISO timestamp which is comparable
 
-                var migrationContent = new StringBuilder();
+                var upMigrationContent = new StringBuilder();
+                var downMigrationContent = new StringBuilder();
                 foreach (var migration in earlierMigrationNames)
                 {
+                    var downMigrationContentSingle = new StringBuilder();
+
                     var migrationLines = File.ReadAllLines(Path.Combine(dir, migration)).ToList();
                     var upLine = migrationLines.Single(l => l.Contains("protected override void Up(MigrationBuilder migrationBuilder)"));
                     var downLine = migrationLines.Single(l => l.Contains("protected override void Down(MigrationBuilder migrationBuilder)"));
@@ -83,34 +92,53 @@ namespace Bokio.MigrationSquasher
                     var downIndex = migrationLines.ToList().IndexOf(downLine);
 
                     var upMigrationClosingLine = downIndex - 2; // Iffy, should iterate backwards instead
-                    
-                    migrationContent.AppendLine();
-                    migrationContent.AppendLine("\t\t\t// From migration " + migration);
-                    for (int lineIndex = upIndex + 2; lineIndex < upMigrationClosingLine; lineIndex++)
+                    var downMigrationClosingLine = migrationLines.Count - 3; // Iffy, should iterate backwards instead
+
+                    upMigrationContent.AppendLine();
+                    upMigrationContent.AppendLine("\t\t\t// From migration " + migration.Replace("./", ""));
+                    for (var lineIndex = upIndex + 2; lineIndex < upMigrationClosingLine; lineIndex++)
                     {
-                        migrationContent.AppendLine(migrationLines[lineIndex]);
+                        upMigrationContent.AppendLine(migrationLines[lineIndex]);
                     }
+
+                    downMigrationContentSingle.AppendLine();
+                    downMigrationContentSingle.AppendLine("\t\t\t// From migration " + migration.Replace("./", ""));
+                    for (var lineIndex = downIndex + 2; lineIndex < downMigrationClosingLine; lineIndex++)
+                    {
+                        downMigrationContentSingle.AppendLine(migrationLines[lineIndex]);
+                    }
+
+                    downMigrationContent.Insert(0, downMigrationContentSingle.ToString());
                 }
 
                 var newMigrationContent = migrationTemplate.Replace(MigrationNamePlaceholder, options.NewName.Substring(15));
-                newMigrationContent = newMigrationContent.Replace(MigrationUpContentPlaceholder, migrationContent.ToString());
+                newMigrationContent = newMigrationContent.Replace(MigrationUpContentPlaceholder, upMigrationContent.ToString());
+                newMigrationContent = newMigrationContent.Replace(MigrationDownContentPlaceholder, downMigrationContent.ToString());
 
                 File.WriteAllText(Path.Combine(dir, options.NewName + ".cs"), newMigrationContent);
 
-                // Write the preparation migration. Must be written after the real migration to make sure the real migratin doesn't include this.
+                // Write the preparation migration. Must be written after the real migration to make sure the real migration doesn't include this.
                 var prepTemplate = migrationTemplate.Replace(MigrationNamePlaceholder, prepMigrationName.Substring(15));
-
-                var prepSql = @$"migrationBuilder.Sql(@""
-IF EXISTS(SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'{targetMigrationName}')
-BEGIN    INSERT INTO [__EFMigrationsHistory] ([MigrationId], [ProductVersion]) VALUES (N'{options.NewName}', N'2.2.4-servicing-10062')
-END;
-GO"");";
+                
+                var prepSql = @$"migrationBuilder.Sql(@""IF EXISTS(SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'{targetMigrationName}')
+                    BEGIN   
+                    WITH Migrations AS  
+                    (  
+                        SELECT 
+	                    ROW_NUMBER() OVER(ORDER BY MigrationId ASC) AS Row, MigrationId
+	                    FROM [__EFMigrationsHistory]
+                    )   
+                    DELETE
+                    FROM Migrations   
+                    WHERE Row <= (SELECT Row FROM Migrations WHERE [MigrationId] = N'{targetMigrationName}');
+                    INSERT INTO [__EFMigrationsHistory] ([MigrationId], [ProductVersion]) VALUES (N'{options.NewName}', N'5.0.5');
+                    END"");";
                 prepTemplate = prepTemplate.Replace(MigrationUpContentPlaceholder, prepSql);
 
-                // Write prepation migration (Inserts migration in the DB)
+                // Write preparation migration (Inserts migration in the DB)
                 File.WriteAllText(Path.Combine(dir, prepMigrationName + ".cs"), prepTemplate);
 
-                var prepSnapshot = File.ReadAllText("emptysnapshottemplate.cs.template")
+                var prepSnapshot = File.ReadAllText("../emptysnapshottemplate.cs.template")
                 .Replace(MigrationNamePlaceholder, prepMigrationName.Substring(15))
                 .Replace(MigrationNameWithTimeStampPlaceholder, prepMigrationName);
 
@@ -121,7 +149,6 @@ GO"");";
                     File.Delete(oldMigration);
                     File.Delete(oldMigration.Replace(".cs", ".Designer.cs"));
                 }
-
             });
         }
     }
